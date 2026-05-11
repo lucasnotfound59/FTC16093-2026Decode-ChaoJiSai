@@ -158,6 +158,7 @@ public class BottomAutoBase extends XKCommandOpmode {
                     gate.open().schedule();
                     setPathState(7);
                 }
+                break;
             case 7:
                 if (pathTimer.getElapsedTimeSeconds() > 1) {
                     gate.close().schedule();

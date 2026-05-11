@@ -200,7 +200,7 @@ public class Drive {
             double currentHeading;
             if(fieldCentric)
             {
-                currentHeading = odometerData.getHeadingRadians() + Math.toDegrees(headingOffset);
+                currentHeading = odometerData.getHeadingRadians() + Math.toRadians(headingOffset);
             }else{
                 currentHeading = 0.0;
             }
