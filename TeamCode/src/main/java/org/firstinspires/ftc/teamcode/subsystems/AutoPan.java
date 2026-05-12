@@ -17,8 +17,8 @@ import org.firstinspires.ftc.teamcode.utils.FieldConstants;
  *   <li><b>{@link Mode}</b>（HOLD / TRACK）—— 外部控制，由 TeleOp DPAD_UP / Auto setMode() 切换。
  *       本类内部从不自动改 {@code currentMode}，操作手是唯一决定瞄不瞄的入口。</li>
  *   <li><b>{@link TrackState}</b>（TRACKING / LOCKED）—— TRACK 模式的内部子状态，处理物理软限位。
- *       目标超出 ±MAX_ANGLE_DEG 时进入 LOCKED 保持原位不动，目标回到范围内再继续追。
- *       LOCKED 不会反向影响 Mode，DPAD_UP 仍然能切走。</li>
+ *       目标超出 ±MAX_ANGLE_DEG 时进入 LOCKED 把 pan 顶到限位侧（给 LL FOV 一个机会捕获到越界 tag），
+ *       目标回到范围内自动解锁。LOCKED 不会反向影响 Mode，DPAD_UP 仍然能切走。</li>
  * </ul>
  *
  * <h3>TRACK 模式的数据来源（每帧 run() 里）</h3>
@@ -72,7 +72,7 @@ public class AutoPan {
     /** TRACK 模式的子状态，仅用于物理软限位。 */
     private enum TrackState {
         TRACKING,   // 正常跟踪
-        LOCKED      // 目标超出 ±MAX_ANGLE_DEG，停在当前位置不下发新目标
+        LOCKED      // 目标超出 ±MAX_ANGLE_DEG，pan 顶到限位侧等待目标回到范围
     }
 
     /** 当前一帧 pan 目标角的来源，仅用于遥测/调试，操作手可据此判断 LL 是否工作。 */
@@ -98,6 +98,11 @@ public class AutoPan {
 
     private boolean isLimitReached = false;
     private double currentRawTarget = 0.0;
+    /**
+     * 目标进入 LOCKED 状态时记录的方位符号（+1 = 目标在右侧 / -1 = 在左侧）。
+     * LOCKED 期间 pan 物理上被顶到 {@code lockedSignum * MAX_ANGLE_DEG}，
+     * 让 LL 在 FOV 内最大化捕获越界 tag 的机会。
+     */
     private double lockedSignum = 0.0;
 
     private int lastTargetTicks = Integer.MIN_VALUE;
@@ -248,12 +253,16 @@ public class AutoPan {
         double headingNow = ppd.getHeadingDegrees();
         double yawRate = ppd.getYawRate();
         double panEncoderDeg = panMotor.getCurrentPosition() / PAN_TICKS_PER_DEGREE;
+        // getVelocity() 是带符号的真实编码器速度（ticks/s），跟 getCurrentPosition()
+        // 共用同一套方向约定。tracker 用它把 panEncoderDeg 外推回 LL 帧捕获时刻，
+        // 避免 pan 自己快速旋转时（如刚切 TRACK 大幅扫向目标）bearing 计算出现 6°+ 偏差。
+        double panRateDegPerSec = panMotor.getVelocity() / PAN_TICKS_PER_DEGREE;
 
         // 1. 视觉测量
         //    每帧都跑，即使 HOLD 模式也跑——目的是让 TRACK 模式刚切换过来时
         //    smoothedBearing 已经有最新数据可用（虽然 setMode 会 reset，但下一帧 LL
         //    一进来就能立刻 fresh，比等 20ms 一帧再 fresh 更顺）。
-        tracker.update(panEncoderDeg, headingNow, yawRate);
+        tracker.update(panEncoderDeg, panRateDegPerSec, headingNow, yawRate);
 
         // 2. 计算原始目标角
         double targetAngleRaw;
@@ -274,10 +283,9 @@ public class AutoPan {
                 relativeAngle = computeBearingFromOdo(ppd);
                 currentSource = Source.ODO_FALLBACK;
             }
+            // LOCKED 状态下也会返回有效角度（被夹在 ±MAX_ANGLE_DEG），
+            // 走正常的死区 + tick 下发流程，pan 物理上停在限位
             targetAngleRaw = applyLockingStateMachine(relativeAngle);
-            // applyLockingStateMachine 返回 NaN 表示当前帧处于 LOCKED 状态，
-            // 不应下发新目标——直接退出 run()，电机保持在上一帧的 lastTargetTicks
-            if (Double.isNaN(targetAngleRaw)) return;
         }
 
         // 3. 角度死区
@@ -313,15 +321,11 @@ public class AutoPan {
     }
 
     /**
-     * 哨兵值：表示当前帧处于锁定状态，调用方应直接 return 不下发。
-     * 用 NaN 是因为它跟所有正常角度都不相等，且必须用 {@link Double#isNaN(double)} 判断
-     * （NaN == NaN 是 false，直接 == 比较会错过）。
-     */
-    private static final double HOLD_BY_LOCK = Double.NaN;
-
-    /**
      * 物理软限位状态机：pan 因线缆走线限制只能在 ±MAX_ANGLE_DEG 内转。
-     * 超出范围时不强行让 pan 撞墙，而是停在当前位置（电子锁定），等目标自然回到范围。
+     * 超出范围时把 pan 顶到限位侧不动，等目标自然回到范围。
+     * 关键：把 pan 推到限位（而不是冻在原地）能让 LL 在 FOV 内捕获到稍微越界的 tag，
+     * 视觉一旦更新 tracker，下一帧相对角度就可能回到 ±90° 内，自动解锁。
+     *
      * 注意：这是 TRACK 模式的内部状态，跟外部的 HOLD/TRACK Mode 互相独立——
      * LOCKED 状态下 currentMode 仍然是 TRACK，操作手按 DPAD_UP 仍能切走。
      */
@@ -332,16 +336,18 @@ public class AutoPan {
                 isLimitReached = false;
                 return relativeAngle;
             }
-            // 进入锁定
+            // 进入锁定：把 pan 推到限位侧，让 LL 在 FOV 内最大化捕获 tag 的机会。
+            // 真实目标在 ±90°~±121° 内（限位 + LL HFOV ±31°）时视觉仍可能锁定，
+            // 一旦 tracker 看到 tag，下一帧 relativeAngle 用视觉算就可能回到 ±90° 内自动解锁。
             trackState = TrackState.LOCKED;
             lockedSignum = Math.signum(relativeAngle);
             isLimitReached = true;
-            return HOLD_BY_LOCK;
+            return lockedSignum * MAX_ANGLE_DEG;
         } else {
-            // LOCKED
+            // LOCKED：继续把 pan 顶在限位处
             if (!inRange) {
                 isLimitReached = true;
-                return HOLD_BY_LOCK;
+                return lockedSignum * MAX_ANGLE_DEG;
             }
             // 回到范围内 → 解锁
             trackState = TrackState.TRACKING;

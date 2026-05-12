@@ -26,7 +26,7 @@ import java.util.List;
  *
  * <h3>典型调用流程（每个控制循环）</h3>
  * <pre>
- *   tracker.update(panEncoderDeg, headingDegNow, yawRateDegPerSec);
+ *   tracker.update(panEncoderDeg, panRateDegPerSec, headingDegNow, yawRateDegPerSec);
  *   if (tracker.isFresh()) {
  *       panTarget = tracker.getBearingWorldDeg() - headingDegNow;
  *   } else {
@@ -58,6 +58,28 @@ public class VisionBearingTracker {
      */
     public static double STALENESS_MAX_MS = 100.0;
 
+    /**
+     * 队内固件烧录的 AprilTag pipeline 编号。
+     * 强制锁定避免有人在 LL Web UI 上手动切到别的 pipeline（如调色环时切去 0/1/2）
+     * 之后忘了切回来，导致 OpMode 启动时 fiducial 结果永远为空、视觉静默失效。
+     */
+    public static final int APRILTAG_PIPELINE = 7;
+
+    /**
+     * LL 光轴相对 pan 零度方向的安装偏置（度），右偏为正。
+     *
+     * 装车后用以下流程标定（标定一次写死）：
+     * 1. 机械上把 pan 对准机器人正前方，STOP_AND_RESET_ENCODER 让 pan_encoder = 0
+     * 2. 在机器人正前方 ~3m 处放一个 AprilTag
+     * 3. 读 LL 报告的 tx
+     * 4. 把这里的常量改成那个 tx 值
+     *
+     * 默认 0.0 假设光轴完美对齐；任何系统性瞄准偏差先怀疑这里没标定。
+     * panOffset (DPAD_LEFT/RIGHT) 是给操作手的临时 trim，跟这个标定值职责不同，
+     * 不要混用。
+     */
+    public static double LL_PAN_OFFSET_DEG = 0.0;
+
     // ==========================================
     // 成员
     // ==========================================
@@ -80,6 +102,7 @@ public class VisionBearingTracker {
 
     public void start() {
         if (ll != null) {
+            ll.pipelineSwitch(APRILTAG_PIPELINE);
             ll.setPollRateHz(50);
             ll.start();
         }
@@ -103,11 +126,13 @@ public class VisionBearingTracker {
     /**
      * 每帧调用。读取 LL 最新一帧，找到目标 tag 后更新世界系方位角。
      *
-     * @param panEncoderDeg     当前 pan 编码器角度（度）
-     * @param headingDegNow     当前机器人 heading（度），来自 odo 陀螺仪
-     * @param yawRateDegPerSec  当前 yaw 角速度（度/秒），用于补偿 LL 延迟期间的旋转
+     * @param panEncoderDeg      当前 pan 编码器角度（度）
+     * @param panRateDegPerSec   当前 pan 角速度（度/秒），用于补偿 LL 延迟期间 pan 自身的旋转
+     * @param headingDegNow      当前机器人 heading（度），来自 odo 陀螺仪
+     * @param yawRateDegPerSec   当前 yaw 角速度（度/秒），用于补偿 LL 延迟期间机器人的旋转
      */
-    public void update(double panEncoderDeg, double headingDegNow, double yawRateDegPerSec) {
+    public void update(double panEncoderDeg, double panRateDegPerSec,
+                       double headingDegNow, double yawRateDegPerSec) {
         if (ll == null || targetTagId < 0) return;
 
         LLResult result = ll.getLatestResult();
@@ -124,16 +149,25 @@ public class VisionBearingTracker {
             if (fr.getFiducialId() != targetTagId) continue;
 
             double tx = fr.getTargetXDegrees();
-            // 用 yaw rate 把 heading 外推回 LL 帧捕获时刻：
-            // captureLatency 是从图像曝光到 SDK 拿到结果之间的时间，
-            // 这段时间里机器人可能已经转过 (yawRate × latency) 度，必须减回去。
-            double headingAtFrame = headingDegNow - yawRateDegPerSec * (captureLatencyMs / 1000.0);
-            // 世界系方位角 = pan 在机器人系角度 + LL 在 pan 上看到的水平偏移 + 当时的机器人朝向
-            // 这三项之和与 tag 的真实位置一一对应，pan 现在转到哪里、heading 现在是多少都不影响
-            double bearingWorld = panEncoderDeg + tx + headingAtFrame;
+            double latencySec = captureLatencyMs / 1000.0;
+            // 把 pan 编码器和机器人 heading 都外推回 LL 帧捕获时刻。
+            // captureLatency 是从图像曝光到 SDK 拿到结果之间的时间，这段时间里
+            // pan 可能自己转了几度（操作手刚切 TRACK 时 pan 大幅扫向目标的瞬间最明显），
+            // 机器人也可能转头。两个 rate 都补偿，bearing_world 才真正不变。
+            double panAtFrame = panEncoderDeg - panRateDegPerSec * latencySec;
+            double headingAtFrame = headingDegNow - yawRateDegPerSec * latencySec;
+            // 世界系方位角 = pan 在机器人系角度 + LL 看到的水平偏移 + 安装偏置修正 + 当时的机器人朝向
+            // LL_PAN_OFFSET_DEG 把 LL 光轴对 pan 零度方向的安装误差减出去，
+            // 让"pan_encoder = 0 时 LL 朝机器人正前方"这个几何假设真正成立。
+            double bearingWorld = panAtFrame + (tx - LL_PAN_OFFSET_DEG) + headingAtFrame;
 
-            if (!hasSmoothed) {
-                // 第一帧直接接受，不做加权——否则 smoothed 从 0 开始要花很多帧才能拉到真值
+            // 历史连续性判断：从未平滑过，或者距离上次有效帧超过 VISION_HOLD_MS
+            // → smoothed 已经过期，跟新测量没有时间连续性，直接重置而不是加权平均。
+            // 这把 VISION_HOLD_MS 升级成"视觉数据连续性窗口"的单一阈值，
+            // 跟 AutoPan 的 isFresh() 控制层判断口径一致。
+            boolean staleHistory = !hasSmoothed
+                    || (System.nanoTime() - lastValidNanos) / 1e6 > VISION_HOLD_MS;
+            if (staleHistory) {
                 smoothedBearingWorldDeg = bearingWorld;
                 hasSmoothed = true;
             } else {
