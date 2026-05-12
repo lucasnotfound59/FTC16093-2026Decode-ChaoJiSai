@@ -5,6 +5,7 @@ import androidx.annotation.NonNull;
 import com.arcrobotics.ftclib.hardware.ServoEx;
 import com.arcrobotics.ftclib.hardware.SimpleServo;
 import com.qualcomm.hardware.gobilda.GoBildaPinpointDriver;
+import com.qualcomm.hardware.limelightvision.Limelight3A;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 import com.qualcomm.robotcore.hardware.HardwareMap;
 import com.qualcomm.robotcore.hardware.VoltageSensor;
@@ -32,6 +33,8 @@ public class Hardwares {
     public static class Sensors{
         public GoBildaPinpointDriver odo;
         public VoltageSensor voltageSensor;
+        /** Limelight 3A 视觉传感器；硬件配置中缺失时为 null（不阻塞启动）。 */
+        public Limelight3A ll;
 
         public Sensors(@NonNull HardwareMap hardwareMap){
             odo = getHardware(hardwareMap, "pinpoint", GoBildaPinpointDriver.class);
@@ -41,6 +44,12 @@ public class Hardwares {
             odo.setEncoderDirections(GoBildaPinpointDriver.EncoderDirection.FORWARD, GoBildaPinpointDriver.EncoderDirection.FORWARD);
 
             voltageSensor = hardwareMap.voltageSensor.iterator().next();
+
+            try {
+                ll = hardwareMap.get(Limelight3A.class, "limelight");
+            } catch (Exception e) {
+                ll = null;
+            }
         }
     }
 

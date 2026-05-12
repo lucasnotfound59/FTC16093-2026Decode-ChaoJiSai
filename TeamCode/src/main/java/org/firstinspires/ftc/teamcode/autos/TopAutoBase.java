@@ -18,6 +18,7 @@ import org.firstinspires.ftc.teamcode.subsystems.Gate;
 import org.firstinspires.ftc.teamcode.subsystems.Intake;
 import org.firstinspires.ftc.teamcode.subsystems.PinpointDriverData;
 import org.firstinspires.ftc.teamcode.subsystems.Shooter;
+import org.firstinspires.ftc.teamcode.utils.FieldConstants;
 import org.firstinspires.ftc.teamcode.utils.XKCommandOpmode;
 
 import java.util.function.Supplier;
@@ -217,7 +218,7 @@ public class TopAutoBase extends XKCommandOpmode {
         hardwares.sensors.odo.setHeading(startDeg, AngleUnit.DEGREES);
 
         pinpointDriverData = new PinpointDriverData(hardwares.sensors.odo);
-        autoPan = new AutoPan(hardwares, autoPanTargetX, autoPanTargetY);
+        autoPan = new AutoPan(hardwares, autoPanTargetX, autoPanTargetY, FieldConstants.tagIdForGoalY(autoPanTargetY));
 
         autoPan.init();
 

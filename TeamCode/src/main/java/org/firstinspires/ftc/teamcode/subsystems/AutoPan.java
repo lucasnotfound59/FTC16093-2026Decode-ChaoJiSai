@@ -7,17 +7,17 @@ import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
 
 import org.firstinspires.ftc.teamcode.Hardwares;
+import org.firstinspires.ftc.teamcode.utils.FieldConstants;
 
 /**
  * 自动云台控制系统
  * 功能：
- * 1. HOLD 模式：锁定朝前 (0度)
- * 2. TRACK 模式：自动跟踪场地坐标，含电子锁定逻辑
- *    - 目标在 ±90° 范围内：正常跟踪
- *    - 目标超出范围：电子锁定（保持当前位置不动）
- *    - 目标从同侧回来：直接解锁继续跟踪
- *    - 目标从异侧回来：解锁后云台自然摆向另一侧跟踪
- * 3. 优化的 CAN 总线通信（仅在目标 ticks 变化时发送指令）
+ * 1. HOLD 模式：锁定朝前 (HOLD_ANGLE)
+ * 2. TRACK 模式：自动跟踪 goal
+ *    - 视觉新鲜（{@link VisionBearingTracker#isFresh()}）→ 用 LL 给出的世界系方位角
+ *    - 视觉陈旧 → 回退到 odo + atan2
+ *    - 目标超出 ±MAX_ANGLE_DEG → 电子锁定（保持当前位置不动）
+ * 3. 输出去抖动：角度死区 + ticks 去重
  */
 public class AutoPan {
 
@@ -31,6 +31,9 @@ public class AutoPan {
     public static final double PAN_POWER = 1;
     public static final double MAX_ANGLE_DEG = 90.0; // 物理线缆限位
 
+    /** pan 目标角变化小于此值时不重新下发，避免高频抖动。 */
+    public static double DEADBAND_DEG = 0.3;
+
     private static final double PAN_P_POS = 15, PAN_P_VEL = 30, PAN_I = 0.01, PAN_F = 0, PAN_D = 0;
 
     private double HOLD_ANGLE = 0.0;
@@ -43,10 +46,16 @@ public class AutoPan {
         TRACK   // 自动跟踪目标坐标
     }
 
-    // TRACK 模式内部状态
     private enum TrackState {
-        TRACKING,   // 正常跟踪
-        LOCKED      // 目标超出范围，电子锁定
+        TRACKING,
+        LOCKED
+    }
+
+    /** 当前一帧 pan 目标角的来源，仅用于遥测。 */
+    public enum Source {
+        HOLD,
+        VISION,
+        ODO_FALLBACK
     }
 
     // ==========================================
@@ -54,35 +63,44 @@ public class AutoPan {
     // ==========================================
     private final DcMotorEx panMotor;
     private final GoBildaPinpointDriver odo;
+    private final VisionBearingTracker tracker;
+
     private Mode currentMode = Mode.HOLD;
     private TrackState trackState = TrackState.TRACKING;
+    private Source currentSource = Source.HOLD;
 
     private final double targetX;
     private final double targetY;
 
     private boolean isLimitReached = false;
     private double currentRawTarget = 0.0;
-    // 锁定时记录目标离开的方向：+1 右侧，-1 左侧
     private double lockedSignum = 0.0;
 
     private int lastTargetTicks = Integer.MIN_VALUE;
+    private double lastCommandedAngle = 0.0;
 
     /**
-     * @param hardwares 硬件映射
-     * @param targetX   目标 X (cm)，场地坐标系
-     * @param targetY   目标 Y (cm)，场地坐标系
+     * @param hardwares    硬件映射
+     * @param targetX      目标 X (cm)，场地坐标系
+     * @param targetY      目标 Y (cm)，场地坐标系
+     * @param targetTagId  对应 goal 的 AprilTag ID；&lt; 0 禁用视觉，纯 odo 跟踪
      */
-    public AutoPan(@NonNull Hardwares hardwares, double targetX, double targetY) {
+    public AutoPan(@NonNull Hardwares hardwares, double targetX, double targetY, int targetTagId) {
         this.panMotor = hardwares.motors.pan;
         this.odo = hardwares.sensors.odo;
         this.targetX = targetX;
         this.targetY = targetY;
+        this.tracker = new VisionBearingTracker(hardwares.sensors.ll, targetTagId);
         this.init();
     }
 
+    /** 向后兼容：不启用视觉。 */
+    public AutoPan(@NonNull Hardwares hardwares, double targetX, double targetY) {
+        this(hardwares, targetX, targetY, FieldConstants.TAG_ID_NONE);
+    }
+
     /**
-     * 初始化硬件，重置编码器零点。
-     * 确保上电时云台处于正前方。
+     * 初始化硬件，重置编码器零点。确保上电时云台处于正前方。
      */
     public void init() {
         panMotor.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
@@ -92,25 +110,27 @@ public class AutoPan {
         panMotor.setPower(0);
 
         lastTargetTicks = 0;
+        lastCommandedAngle = 0.0;
         trackState = TrackState.TRACKING;
+        tracker.reset();
 
         odo.recalibrateIMU();
     }
 
     /**
-     * 比赛开始时调用：启动 RUN_TO_POSITION 并锁定 0 度。
+     * 比赛开始时调用：启动 RUN_TO_POSITION 并锁定 0 度，同时启动视觉。
      */
     public void setup() {
         panMotor.setTargetPosition(0);
         panMotor.setMode(DcMotor.RunMode.RUN_TO_POSITION);
         panMotor.setPower(PAN_POWER);
         this.currentMode = Mode.HOLD;
+        tracker.start();
     }
 
     public void setMode(Mode mode) {
         if (this.currentMode != mode) {
             this.currentMode = mode;
-            // 切换到 TRACK 时重置锁定状态
             if (mode == Mode.TRACK) {
                 trackState = TrackState.TRACKING;
             }
@@ -118,15 +138,15 @@ public class AutoPan {
     }
 
     public void switchMode() {
-        if (this.currentMode == Mode.HOLD) {
-            setMode(Mode.TRACK);
-        } else {
-            setMode(Mode.HOLD);
-        }
+        setMode(currentMode == Mode.HOLD ? Mode.TRACK : Mode.HOLD);
     }
 
     public Mode getMode() {
         return currentMode;
+    }
+
+    public VisionBearingTracker getTracker() {
+        return tracker;
     }
 
     // ==========================================
@@ -135,39 +155,48 @@ public class AutoPan {
     public static class TelemetryState {
         public final Mode mode;
         public final TrackState trackState;
+        public final Source source;
         public final double rawTargetAngle;
         public final double currentAngle;
         public final boolean isLimitReached;
         public final double motorPower;
+        public final boolean visionFresh;
+        public final double lastTxDeg;
+        public final double smoothedBearingWorldDeg;
 
-        public TelemetryState(Mode mode, TrackState trackState, double rawTargetAngle,
-                              double currentAngle, boolean isLimitReached, double motorPower) {
+        public TelemetryState(Mode mode, TrackState trackState, Source source,
+                              double rawTargetAngle, double currentAngle,
+                              boolean isLimitReached, double motorPower,
+                              boolean visionFresh, double lastTxDeg, double smoothedBearingWorldDeg) {
             this.mode = mode;
             this.trackState = trackState;
+            this.source = source;
             this.rawTargetAngle = rawTargetAngle;
             this.currentAngle = currentAngle;
             this.isLimitReached = isLimitReached;
             this.motorPower = motorPower;
+            this.visionFresh = visionFresh;
+            this.lastTxDeg = lastTxDeg;
+            this.smoothedBearingWorldDeg = smoothedBearingWorldDeg;
         }
 
         @NonNull
         @Override
         public String toString() {
             return String.format(java.util.Locale.US,
-                    "Mode: %s (%s)\nAngle(Target/Curr): %.1f / %.1f\nLimit Reached: %b\nPower: %.2f",
-                    mode, trackState, rawTargetAngle, currentAngle, isLimitReached, motorPower);
+                    "Mode: %s (%s, src=%s)\nAngle(Target/Curr): %.1f / %.1f\nLimit: %b\nPower: %.2f\nVision: fresh=%b tx=%.2f bearing=%.1f",
+                    mode, trackState, source, rawTargetAngle, currentAngle, isLimitReached, motorPower,
+                    visionFresh, lastTxDeg, smoothedBearingWorldDeg);
         }
     }
 
     public TelemetryState getTelemetryStatus() {
         double currentPosDeg = panMotor.getCurrentPosition() / PAN_TICKS_PER_DEGREE;
         return new TelemetryState(
-                currentMode,
-                trackState,
-                currentRawTarget,
-                currentPosDeg,
-                isLimitReached,
-                panMotor.getPower()
+                currentMode, trackState, currentSource,
+                currentRawTarget, currentPosDeg,
+                isLimitReached, panMotor.getPower(),
+                tracker.isFresh(), tracker.getLastTxDeg(), tracker.getBearingWorldDeg()
         );
     }
 
@@ -179,63 +208,50 @@ public class AutoPan {
     }
 
     /**
-     * 在主循环中每帧调用，更新云台目标位置。
-     * @param pinpointDriverData 最新里程计数据
-     * @param offsetDegree       手动偏置角度（度）
+     * 每帧调用，更新云台目标位置。
+     *
+     * @param ppd          最新里程计数据
+     * @param offsetDegree 手动偏置角度（度）
      */
-    public void run(PinpointDriverData pinpointDriverData, double offsetDegree) {
-        if (pinpointDriverData == null) return;
+    public void run(PinpointDriverData ppd, double offsetDegree) {
+        if (ppd == null) return;
 
+        double headingNow = ppd.getHeadingDegrees();
+        double yawRate = ppd.getYawRate();
+        double panEncoderDeg = panMotor.getCurrentPosition() / PAN_TICKS_PER_DEGREE;
+
+        // 1. 视觉测量（无副作用读 LL）
+        tracker.update(panEncoderDeg, headingNow, yawRate);
+
+        // 2. 计算原始目标角
         double targetAngleRaw;
-
         if (currentMode == Mode.HOLD) {
             targetAngleRaw = HOLD_ANGLE;
+            currentSource = Source.HOLD;
             isLimitReached = false;
         } else {
-            // ---- TRACK 模式 ----
-            double dx = targetX - pinpointDriverData.getRobotX();
-            double dy = targetY - pinpointDriverData.getRobotY();
-            double angleToGoal = Math.toDegrees(Math.atan2(dy, dx));
-            // 目标相对机器人朝向的角度，归一化到 [-180, 180]
-            double relativeAngle = normalizeAngle(angleToGoal - pinpointDriverData.getHeadingDegrees());
-
-            boolean inRange = Math.abs(relativeAngle) <= MAX_ANGLE_DEG;
-
-            if (trackState == TrackState.TRACKING) {
-                if (inRange) {
-                    // 正常跟踪
-                    targetAngleRaw = relativeAngle;
-                    isLimitReached = false;
-                } else {
-                    // 目标离开范围 → 电子锁定，保持当前位置
-                    trackState = TrackState.LOCKED;
-                    lockedSignum = Math.signum(relativeAngle);
-                    isLimitReached = true;
-                    return; // 不更新电机目标，保持锁定
-                }
+            double relativeAngle;
+            if (tracker.isFresh()) {
+                relativeAngle = normalizeAngle(tracker.getBearingWorldDeg() - headingNow);
+                currentSource = Source.VISION;
             } else {
-                // ---- LOCKED 状态 ----
-                if (!inRange) {
-                    // 目标仍在范围外，继续锁定
-                    isLimitReached = true;
-                    return;
-                }
-
-                // 目标回到范围内 → 解锁
-                trackState = TrackState.TRACKING;
-                isLimitReached = false;
-                targetAngleRaw = relativeAngle;
-                // 同侧（signum 相同）：云台小幅调整回到目标
-                // 异侧（signum 不同）：云台自然从一侧摆向另一侧（约 180° 摆动）
-                // 两种情况下均直接命令到目标角度，行为由电机 PIDF 自然完成
+                relativeAngle = computeBearingFromOdo(ppd);
+                currentSource = Source.ODO_FALLBACK;
             }
+            targetAngleRaw = applyLockingStateMachine(relativeAngle);
+            if (Double.isNaN(targetAngleRaw)) return; // 锁定中，不下发
         }
 
-        this.currentRawTarget = targetAngleRaw;
+        // 3. 角度死区
+        if (Math.abs(normalizeAngle(targetAngleRaw - lastCommandedAngle)) < DEADBAND_DEG) {
+            targetAngleRaw = lastCommandedAngle;
+        } else {
+            lastCommandedAngle = targetAngleRaw;
+        }
+        currentRawTarget = targetAngleRaw;
 
+        // 4. 下发 ticks（变化才发，节省 CAN）
         int targetTicks = (int) Math.round((targetAngleRaw + offsetDegree) * PAN_TICKS_PER_DEGREE);
-
-        // 仅在目标变化时发送指令，节省 CAN 带宽
         if (targetTicks != lastTargetTicks) {
             panMotor.setTargetPosition(targetTicks);
             if (panMotor.getMode() != DcMotor.RunMode.RUN_TO_POSITION) {
@@ -246,7 +262,42 @@ public class AutoPan {
         }
     }
 
-    private double normalizeAngle(double angle) {
+    private double computeBearingFromOdo(PinpointDriverData ppd) {
+        double dx = targetX - ppd.getRobotX();
+        double dy = targetY - ppd.getRobotY();
+        double angleToGoal = Math.toDegrees(Math.atan2(dy, dx));
+        return normalizeAngle(angleToGoal - ppd.getHeadingDegrees());
+    }
+
+    /** 哨兵值：表示当前帧处于锁定状态，调用方应直接 return 不下发。 */
+    private static final double HOLD_BY_LOCK = Double.NaN;
+
+    private double applyLockingStateMachine(double relativeAngle) {
+        boolean inRange = Math.abs(relativeAngle) <= MAX_ANGLE_DEG;
+        if (trackState == TrackState.TRACKING) {
+            if (inRange) {
+                isLimitReached = false;
+                return relativeAngle;
+            }
+            // 进入锁定
+            trackState = TrackState.LOCKED;
+            lockedSignum = Math.signum(relativeAngle);
+            isLimitReached = true;
+            return HOLD_BY_LOCK;
+        } else {
+            // LOCKED
+            if (!inRange) {
+                isLimitReached = true;
+                return HOLD_BY_LOCK;
+            }
+            // 回到范围内 → 解锁
+            trackState = TrackState.TRACKING;
+            isLimitReached = false;
+            return relativeAngle;
+        }
+    }
+
+    private static double normalizeAngle(double angle) {
         while (angle > 180) angle -= 360;
         while (angle <= -180) angle += 360;
         return angle;

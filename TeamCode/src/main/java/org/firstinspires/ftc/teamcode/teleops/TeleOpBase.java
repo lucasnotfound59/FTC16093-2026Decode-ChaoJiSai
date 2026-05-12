@@ -19,6 +19,7 @@ import org.firstinspires.ftc.teamcode.subsystems.Intake;
 import org.firstinspires.ftc.teamcode.subsystems.PinpointDriverData;
 import org.firstinspires.ftc.teamcode.subsystems.Shooter;
 import org.firstinspires.ftc.teamcode.utils.ButtonEx;
+import org.firstinspires.ftc.teamcode.utils.FieldConstants;
 import org.firstinspires.ftc.teamcode.utils.XKCommandOpmode;
 
 
@@ -67,7 +68,7 @@ public class TeleOpBase extends XKCommandOpmode {
         hardwares.sensors.odo.setHeading(startDeg, AngleUnit.DEGREES);
         this.pinpointDriverData = new PinpointDriverData(hardwares.sensors.odo);
 
-        autoPan = new AutoPan(hardwares, targetX, targetY);
+        autoPan = new AutoPan(hardwares, targetX, targetY, FieldConstants.tagIdForGoalY(targetY));
         autoPan.init();
 
         drive = new Drive(hardwares);
@@ -120,8 +121,13 @@ public class TeleOpBase extends XKCommandOpmode {
         this.multipleTelemetry.addLine("---");
         AutoPan.TelemetryState panTelemetry = autoPan.getTelemetryStatus();
         this.multipleTelemetry.addData("pan mode", panTelemetry.mode);
+        this.multipleTelemetry.addData("pan source", panTelemetry.source);
         this.multipleTelemetry.addData("pan angle (deg)", panTelemetry.currentAngle);
+        this.multipleTelemetry.addData("pan target (deg)", panTelemetry.rawTargetAngle);
         this.multipleTelemetry.addData("pan limit reached", panTelemetry.isLimitReached);
+        this.multipleTelemetry.addData("vision fresh", panTelemetry.visionFresh);
+        this.multipleTelemetry.addData("vision tx (deg)", panTelemetry.lastTxDeg);
+        this.multipleTelemetry.addData("vision bearing world (deg)", panTelemetry.smoothedBearingWorldDeg);
 
         this.multipleTelemetry.addLine("---");
         Shooter.TelemetryState shooterState = shooter.getTelemetryState();
