@@ -10,14 +10,28 @@ import org.firstinspires.ftc.teamcode.Hardwares;
 import org.firstinspires.ftc.teamcode.utils.FieldConstants;
 
 /**
- * 自动云台控制系统
- * 功能：
- * 1. HOLD 模式：锁定朝前 (HOLD_ANGLE)
- * 2. TRACK 模式：自动跟踪 goal
- *    - 视觉新鲜（{@link VisionBearingTracker#isFresh()}）→ 用 LL 给出的世界系方位角
- *    - 视觉陈旧 → 回退到 odo + atan2
- *    - 目标超出 ±MAX_ANGLE_DEG → 电子锁定（保持当前位置不动）
- * 3. 输出去抖动：角度死区 + ticks 去重
+ * 自动云台控制系统。
+ *
+ * <h3>两层状态</h3>
+ * <ul>
+ *   <li><b>{@link Mode}</b>（HOLD / TRACK）—— 外部控制，由 TeleOp DPAD_UP / Auto setMode() 切换。
+ *       本类内部从不自动改 {@code currentMode}，操作手是唯一决定瞄不瞄的入口。</li>
+ *   <li><b>{@link TrackState}</b>（TRACKING / LOCKED）—— TRACK 模式的内部子状态，处理物理软限位。
+ *       目标超出 ±MAX_ANGLE_DEG 时进入 LOCKED 保持原位不动，目标回到范围内再继续追。
+ *       LOCKED 不会反向影响 Mode，DPAD_UP 仍然能切走。</li>
+ * </ul>
+ *
+ * <h3>TRACK 模式的数据来源（每帧 run() 里）</h3>
+ * <ol>
+ *   <li>视觉新鲜（{@link VisionBearingTracker#isFresh()} == true）→ 用 LL 给出的世界系方位角
+ *       减当前 heading；这是首选，因为 LL 的角度测量精度（亚度）远高于 odo 漂移后的精度。</li>
+ *   <li>视觉陈旧 → 退回 odo {@code atan2(targetY-robotY, targetX-robotX) - heading}；
+ *       odo 位置可能因为撞击离地漂过，但短暂遮挡（&lt; VISION_HOLD_MS）情况下 odo 仍是合理近似。</li>
+ * </ol>
+ *
+ * <h3>输出去抖动</h3>
+ * 死区 ({@link #DEADBAND_DEG}) + ticks 去重，避免电机 PIDF 内环 hunting。
+ * 两者作用环节不同：死区滤掉控制目标的微小变化，ticks 去重消除量化误差导致的重复下发。
  */
 public class AutoPan {
 
@@ -31,7 +45,15 @@ public class AutoPan {
     public static final double PAN_POWER = 1;
     public static final double MAX_ANGLE_DEG = 90.0; // 物理线缆限位
 
-    /** pan 目标角变化小于此值时不重新下发，避免高频抖动。 */
+    /**
+     * pan 目标角变化小于此值时不重新下发，避免电机 PIDF 内环 hunting。
+     *
+     * 注意：这看起来跟 {@code lastTargetTicks != targetTicks} 的 ticks 去重重叠
+     * （1 tick ≈ 0.495°，比 0.3° 还大），但实际上两者作用不同：
+     * - ticks 去重消除量化抖动（角度小变化但 tick 相同）
+     * - 死区在角度本身就稳定但浮点尾数不停跳时止血（防止 PIDF 反复重启目标）
+     * GoBilda 电机带齿轮减速后惯量大、响应慢，多一层保护值得。
+     */
     public static double DEADBAND_DEG = 0.3;
 
     private static final double PAN_P_POS = 15, PAN_P_VEL = 30, PAN_I = 0.01, PAN_F = 0, PAN_D = 0;
@@ -41,21 +63,23 @@ public class AutoPan {
     // ==========================================
     // 状态定义
     // ==========================================
+    /** 外部控制的主模式。本类从不自动改 currentMode。 */
     public enum Mode {
-        HOLD,   // 锁定朝前
-        TRACK   // 自动跟踪目标坐标
+        HOLD,   // 锁定朝前 (HOLD_ANGLE)，视觉数据忽略
+        TRACK   // 自动跟踪目标坐标，视觉优先、odo 兜底
     }
 
+    /** TRACK 模式的子状态，仅用于物理软限位。 */
     private enum TrackState {
-        TRACKING,
-        LOCKED
+        TRACKING,   // 正常跟踪
+        LOCKED      // 目标超出 ±MAX_ANGLE_DEG，停在当前位置不下发新目标
     }
 
-    /** 当前一帧 pan 目标角的来源，仅用于遥测。 */
+    /** 当前一帧 pan 目标角的来源，仅用于遥测/调试，操作手可据此判断 LL 是否工作。 */
     public enum Source {
-        HOLD,
-        VISION,
-        ODO_FALLBACK
+        HOLD,           // currentMode == HOLD
+        VISION,         // currentMode == TRACK 且 tracker.isFresh()
+        ODO_FALLBACK    // currentMode == TRACK 但视觉陈旧
     }
 
     // ==========================================
@@ -128,11 +152,16 @@ public class AutoPan {
         tracker.start();
     }
 
+    /**
+     * 切换主模式。进入 TRACK 时清空视觉历史，避免 HOLD 期间 pan 转向其他方向
+     * 偶然扫到的 tag 留下污染的 smoothedBearing，导致 TRACK 一开始就指向错误位置。
+     */
     public void setMode(Mode mode) {
         if (this.currentMode != mode) {
             this.currentMode = mode;
             if (mode == Mode.TRACK) {
                 trackState = TrackState.TRACKING;
+                tracker.reset();
             }
         }
     }
@@ -220,26 +249,35 @@ public class AutoPan {
         double yawRate = ppd.getYawRate();
         double panEncoderDeg = panMotor.getCurrentPosition() / PAN_TICKS_PER_DEGREE;
 
-        // 1. 视觉测量（无副作用读 LL）
+        // 1. 视觉测量
+        //    每帧都跑，即使 HOLD 模式也跑——目的是让 TRACK 模式刚切换过来时
+        //    smoothedBearing 已经有最新数据可用（虽然 setMode 会 reset，但下一帧 LL
+        //    一进来就能立刻 fresh，比等 20ms 一帧再 fresh 更顺）。
         tracker.update(panEncoderDeg, headingNow, yawRate);
 
         // 2. 计算原始目标角
         double targetAngleRaw;
         if (currentMode == Mode.HOLD) {
+            // HOLD 完全无视视觉，pan 锁在外部设置的 HOLD_ANGLE
             targetAngleRaw = HOLD_ANGLE;
             currentSource = Source.HOLD;
             isLimitReached = false;
         } else {
+            // TRACK 模式：视觉优先 → odo 兜底
             double relativeAngle;
             if (tracker.isFresh()) {
+                // 世界系 bearing 减当前 heading = 机器人系下的 pan 目标角
                 relativeAngle = normalizeAngle(tracker.getBearingWorldDeg() - headingNow);
                 currentSource = Source.VISION;
             } else {
+                // 视觉超过保鲜期（VISION_HOLD_MS），LL 可能被挡或硬件未配
                 relativeAngle = computeBearingFromOdo(ppd);
                 currentSource = Source.ODO_FALLBACK;
             }
             targetAngleRaw = applyLockingStateMachine(relativeAngle);
-            if (Double.isNaN(targetAngleRaw)) return; // 锁定中，不下发
+            // applyLockingStateMachine 返回 NaN 表示当前帧处于 LOCKED 状态，
+            // 不应下发新目标——直接退出 run()，电机保持在上一帧的 lastTargetTicks
+            if (Double.isNaN(targetAngleRaw)) return;
         }
 
         // 3. 角度死区
@@ -262,6 +300,11 @@ public class AutoPan {
         }
     }
 
+    /**
+     * 视觉不可用时的兜底方案：从 odo 位置算出 pan 目标角。
+     * odo 漂移会直接转化为这里的角度误差——这是本系统当初引入视觉的根本动因。
+     * 兜底逻辑只在 VISION_HOLD_MS 这段保鲜期之外才用，正常工作时几乎不走这条路径。
+     */
     private double computeBearingFromOdo(PinpointDriverData ppd) {
         double dx = targetX - ppd.getRobotX();
         double dy = targetY - ppd.getRobotY();
@@ -269,9 +312,19 @@ public class AutoPan {
         return normalizeAngle(angleToGoal - ppd.getHeadingDegrees());
     }
 
-    /** 哨兵值：表示当前帧处于锁定状态，调用方应直接 return 不下发。 */
+    /**
+     * 哨兵值：表示当前帧处于锁定状态，调用方应直接 return 不下发。
+     * 用 NaN 是因为它跟所有正常角度都不相等，且必须用 {@link Double#isNaN(double)} 判断
+     * （NaN == NaN 是 false，直接 == 比较会错过）。
+     */
     private static final double HOLD_BY_LOCK = Double.NaN;
 
+    /**
+     * 物理软限位状态机：pan 因线缆走线限制只能在 ±MAX_ANGLE_DEG 内转。
+     * 超出范围时不强行让 pan 撞墙，而是停在当前位置（电子锁定），等目标自然回到范围。
+     * 注意：这是 TRACK 模式的内部状态，跟外部的 HOLD/TRACK Mode 互相独立——
+     * LOCKED 状态下 currentMode 仍然是 TRACK，操作手按 DPAD_UP 仍能切走。
+     */
     private double applyLockingStateMachine(double relativeAngle) {
         boolean inRange = Math.abs(relativeAngle) <= MAX_ANGLE_DEG;
         if (trackState == TrackState.TRACKING) {

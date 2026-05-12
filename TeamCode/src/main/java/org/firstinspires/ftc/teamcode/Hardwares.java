@@ -45,6 +45,9 @@ public class Hardwares {
 
             voltageSensor = hardwareMap.voltageSensor.iterator().next();
 
+            // LL 找不到（机器人配置里没有"limelight"，或硬件没装）时静默降级为 null。
+            // VisionBearingTracker 看到 ll==null 永远返回 isFresh=false，
+            // AutoPan 自动退到纯 odo 跟踪——保持没 LL 的车也能跑这套代码。
             try {
                 ll = hardwareMap.get(Limelight3A.class, "limelight");
             } catch (Exception e) {
