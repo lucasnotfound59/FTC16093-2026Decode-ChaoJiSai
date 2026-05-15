@@ -40,6 +40,18 @@ public class VisionBearingTracker {
     // 调参（public 方便从 Dashboard 改）
     // ==========================================
     /**
+     * 视觉总开关。设为 false 时整套视觉链路被绕过：
+     * - {@link #start()} 不启动 LL
+     * - {@link #update(double, double, double, double)} 立刻 return
+     * - {@link #isFresh()} 永远 false → AutoPan 永远走 ODO_FALLBACK
+     *
+     * 用途：装车初期、视觉故障排查、AB 对比测试时强制纯 odo 模式，
+     * 不需要从机器人配置里删掉 LL 设备就能停用视觉。
+     * 非 final，Dashboard 也能临时切换（但 OpMode start 之后切到 true 不会自动启动 LL）。
+     */
+    public static boolean USE_LIMELIGHT = false;
+
+    /**
      * 视觉数据保鲜期（毫秒）：超过这个时间没有有效帧，isFresh() 返回 false。
      * 80ms ≈ LL 50Hz 下 4 帧的容错；超出后立即退回 odo，避免在保鲜期里机器人继续
      * 移动导致存储的世界系方位角越用越偏。
@@ -101,6 +113,7 @@ public class VisionBearingTracker {
     }
 
     public void start() {
+        if (!USE_LIMELIGHT) return;
         if (ll != null) {
             ll.pipelineSwitch(APRILTAG_PIPELINE);
             ll.setPollRateHz(50);
@@ -133,6 +146,7 @@ public class VisionBearingTracker {
      */
     public void update(double panEncoderDeg, double panRateDegPerSec,
                        double headingDegNow, double yawRateDegPerSec) {
+        if (!USE_LIMELIGHT) return;
         if (ll == null || targetTagId < 0) return;
 
         LLResult result = ll.getLatestResult();
@@ -184,6 +198,7 @@ public class VisionBearingTracker {
 
     /** 视觉数据是否在保鲜期内（最近 VISION_HOLD_MS 毫秒内有有效更新）。 */
     public boolean isFresh() {
+        if (!USE_LIMELIGHT) return false;
         if (lastValidNanos == 0L) return false;
         double elapsedMs = (System.nanoTime() - lastValidNanos) / 1e6;
         return elapsedMs < VISION_HOLD_MS;
@@ -204,7 +219,7 @@ public class VisionBearingTracker {
     }
 
     public boolean isEnabled() {
-        return ll != null && targetTagId >= 0;
+        return USE_LIMELIGHT && ll != null && targetTagId >= 0;
     }
 
     private static double normalizeAngle(double angle) {

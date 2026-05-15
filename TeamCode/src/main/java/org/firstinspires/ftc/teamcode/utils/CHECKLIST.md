@@ -2,6 +2,13 @@
 
 新车装好后、第一次跑 TeleOp 之前依次过一遍。打勾的项目都做完才能信视觉数据。
 
+## 〇、视觉总开关
+
+- **文件**：[../subsystems/VisionBearingTracker.java](../subsystems/VisionBearingTracker.java) 的 `USE_LIMELIGHT`
+- 设为 `false` 时整套视觉链路被绕过，AutoPan 永远走纯 odo（跟视觉接入前的行为一致）
+- 用途：装车初期 / 视觉故障排查 / AB 对比测试
+- 上场前确认是 `true`，否则下面所有标定都是白做
+
 ## 一、必做（不做视觉根本不工作）
 
 ### 1. AprilTag ID 写实际值
